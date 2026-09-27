@@ -1,0 +1,6 @@
+{
+  "name": "Anon",
+  "description": "100% 완전 익명 소셜 피드 및 커뮤니티 앱",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
