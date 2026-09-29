@@ -88,8 +88,9 @@ fun CommunityScreen(
     }
 
     val filteredPosts = remember(posts, selectedCategory) {
-        if (selectedCategory == PostCategory.ALL) posts
+        val base = if (selectedCategory == PostCategory.ALL) posts
         else posts.filter { it.category == selectedCategory }
+        base.distinctBy { it.id }
     }
 
     val selectedPost = remember(posts, selectedPostId) {
@@ -502,8 +503,9 @@ fun SimplifiedPostCard(
                             tint = AnonSecondary,
                             modifier = Modifier.size(15.dp)
                         )
+                        val displayCommentsCount = if (post.comments.isNotEmpty()) post.comments.distinctBy { it.id }.size else post.commentsCount
                         Text(
-                            text = "댓글수 ${post.commentsCount}",
+                            text = "댓글수 $displayCommentsCount",
                             color = AnonSecondary,
                             fontSize = 12.sp,
                             fontWeight = FontWeight.Medium
@@ -586,6 +588,7 @@ fun PostDetailFullScreen(
     var showReportPostDialog by remember { mutableStateOf(false) }
     var commentToDelete by remember { mutableStateOf<Comment?>(null) }
     var commentToReport by remember { mutableStateOf<Comment?>(null) }
+    val uniqueComments = remember(post.comments) { post.comments.distinctBy { it.id } }
 
     // 게시글 삭제 확인 다이얼로그
     if (showDeletePostDialog) {
@@ -992,8 +995,9 @@ fun PostDetailFullScreen(
                                     modifier = Modifier.size(17.dp)
                                 )
                                 Spacer(modifier = Modifier.width(4.dp))
+                                val displayCommentsCount = if (post.comments.isNotEmpty()) post.comments.distinctBy { it.id }.size else post.commentsCount
                                 Text(
-                                    text = "${post.commentsCount}",
+                                    text = "$displayCommentsCount",
                                     color = AnonTextSecondary,
                                     fontSize = 13.sp,
                                     fontWeight = FontWeight.Medium
@@ -1038,7 +1042,7 @@ fun PostDetailFullScreen(
             }
 
             // 댓글 목록
-            if (post.comments.isEmpty()) {
+            if (uniqueComments.isEmpty()) {
                 item {
                     Box(
                         contentAlignment = Alignment.Center,
@@ -1054,7 +1058,7 @@ fun PostDetailFullScreen(
                     }
                 }
             } else {
-                items(post.comments, key = { it.id }) { comment ->
+                items(uniqueComments, key = { it.id }) { comment ->
                     Column(
                         modifier = Modifier
                             .fillMaxWidth()

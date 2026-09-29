@@ -172,11 +172,14 @@ fun ChatRoomListScreen(
                 }
             }
         } else {
+            val uniqueRooms = remember(chatRooms) {
+                chatRooms.distinctBy { it.id }
+            }
             LazyColumn(
                 verticalArrangement = Arrangement.spacedBy(10.dp),
                 modifier = Modifier.weight(1f)
             ) {
-                items(chatRooms, key = { it.id }) { room ->
+                items(uniqueRooms, key = { it.id }) { room ->
                     Card(
                         shape = RoundedCornerShape(16.dp),
                         colors = CardDefaults.cardColors(containerColor = AnonSurface),

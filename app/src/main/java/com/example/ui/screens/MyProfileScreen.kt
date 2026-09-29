@@ -98,7 +98,13 @@ fun MyProfileScreen(
     val posts by repository.posts.collectAsState()
 
     val myPosts = remember(posts, currentUser.id) {
-        posts.filter { it.isMyPost || (it.authorId.isNotBlank() && it.authorId == currentUser.id) }
+        val cleanId = currentUser.id.trim().lowercase()
+        if (cleanId.isBlank() || cleanId == "user_me_anon") {
+            emptyList()
+        } else {
+            posts.filter { it.authorId.isNotBlank() && it.authorId.equals(cleanId, ignoreCase = true) }
+                .distinctBy { it.id }
+        }
     }
 
     var selectedTab by remember { mutableIntStateOf(0) } // 0: 프로필 & 방문자/하트, 1: 내가 쓴 게시글

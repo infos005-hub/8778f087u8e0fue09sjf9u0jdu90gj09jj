@@ -137,6 +137,53 @@ class FirestoreCommunityService {
     }
 
     /**
+     * 마지막 로그인 세션을 클라우드(REST + Firestore)에 보존
+     */
+    suspend fun saveSessionInCloud(user: UserProfile, password: String = "") {
+        restSyncService.saveSessionToCloud(user, password)
+        val firestore = db ?: return
+        try {
+            val sessionData = hashMapOf(
+                "userId" to user.id,
+                "isLoggedIn" to true,
+                "nickname" to user.nickname,
+                "updatedAt" to System.currentTimeMillis()
+            )
+            firestore.collection(COLLECTION_ACCOUNTS).document("_last_active_session").set(sessionData).await()
+        } catch (e: Exception) {
+            Log.w(TAG, "saveSessionInCloud firestore: ${e.message}")
+        }
+    }
+
+    /**
+     * 클라우드에 저장된 모든 등록 계정 및 세션 통합 동기화
+     */
+    suspend fun syncAllAccountsAndSession(): CloudRestSyncService.CloudSyncResult {
+        val restResult = restSyncService.restoreAllAccountsAndSessionFromCloud()
+        val firestore = db
+        if (firestore != null) {
+            try {
+                val snapshot = firestore.collection(COLLECTION_ACCOUNTS).get().await()
+                val firestoreAccounts = mutableMapOf<String, Pair<String, UserProfile>>()
+                for (doc in snapshot.documents) {
+                    if (doc.id == "_last_active_session") continue
+                    val data = doc.data ?: continue
+                    val id = doc.id
+                    val pwd = data["password"] as? String ?: ""
+                    val profile = parseUserProfile(id, data)
+                    firestoreAccounts[id] = Pair(pwd, profile)
+                }
+                if (firestoreAccounts.isNotEmpty()) {
+                    com.example.data.local.PersistentVaultManager.instance.mergeAccountsFromMap(firestoreAccounts)
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "Firestore syncAllAccounts notice: ${e.message}")
+            }
+        }
+        return restResult
+    }
+
+    /**
      * 클라우드 계정 정보 조회 (로그인 인증 및 프로필 복원용)
      */
     suspend fun getAccountFromCloud(id: String): Map<String, Any>? {
@@ -208,6 +255,24 @@ class FirestoreCommunityService {
             }
         }
         return restSuccess
+    }
+
+    /**
+     * 회원 탈퇴: 클라우드 Firestore 및 REST 동기화 서버에서 계정 및 프로필 완전 삭제
+     */
+    suspend fun deleteAccountFromCloud(id: String): Boolean {
+        val cleanId = id.trim().lowercase()
+        restSyncService.deleteAccount(cleanId)
+        val firestore = db
+        if (firestore != null) {
+            try {
+                firestore.collection(COLLECTION_ACCOUNTS).document(cleanId).delete().await()
+                firestore.collection(COLLECTION_USERS).document(cleanId).delete().await()
+            } catch (e: Exception) {
+                Log.w(TAG, "Firestore delete notice: ${e.message}")
+            }
+        }
+        return true
     }
 
     /**
@@ -344,6 +409,14 @@ class FirestoreCommunityService {
      */
     suspend fun incrementPostViews(postId: String) {
         restSyncService.incrementViews(postId)
+        val firestore = db ?: return
+        try {
+            firestore.collection(COLLECTION_POSTS).document(postId)
+                .update("viewsCount", FieldValue.increment(1))
+                .await()
+        } catch (e: Exception) {
+            Log.w(TAG, "Firestore incrementPostViews notice: ${e.message}")
+        }
     }
 
     /**
@@ -357,7 +430,14 @@ class FirestoreCommunityService {
      * 게시글 시딩 (클라우드 저장소가 비어있을 때 최초 1회 초기화)
      */
     suspend fun seedInitialPostsIfEmpty(defaultPosts: List<Post>): Boolean {
-        return restSyncService.seedInitialPostsIfEmpty(defaultPosts)
+        val existing = restSyncService.fetchPosts()
+        if (existing.isEmpty() && defaultPosts.isNotEmpty()) {
+            for (p in defaultPosts) {
+                restSyncService.createPost(p)
+            }
+            return true
+        }
+        return false
     }
 
     /**

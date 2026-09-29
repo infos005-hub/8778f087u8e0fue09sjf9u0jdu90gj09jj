@@ -79,6 +79,8 @@ class AppRepository {
         seedInitialVisitors()
         subscribeToCloudPosts()
         subscribeToCurrentUserProfile()
+        // 앱 수정/업그레이드/재설치 시에도 계정 정보가 절대 날아가지 않도록 클라우드 자동 복원
+        syncCloudAccountsAndSession()
     }
 
     private var userProfileJob: Job? = null
@@ -163,23 +165,56 @@ class AppRepository {
         }
     }
 
+    fun reevaluatePostsOwnership(userId: String) {
+        val cleanId = userId.trim().lowercase()
+        val isValidUser = _isLoggedIn.value && cleanId.isNotBlank() && cleanId != "user_me_anon"
+        _posts.update { list ->
+            list.map { post ->
+                val isMyPost = isValidUser && post.authorId.isNotBlank() &&
+                        !post.authorId.equals("user_me_anon", ignoreCase = true) &&
+                        post.authorId.equals(cleanId, ignoreCase = true)
+                val mappedComments = post.comments.map { comment ->
+                    val isMyComment = isValidUser && comment.authorId.isNotBlank() &&
+                            !comment.authorId.equals("user_me_anon", ignoreCase = true) &&
+                            comment.authorId.equals(cleanId, ignoreCase = true)
+                    val isAuthor = post.authorId.isNotBlank() && comment.authorId.isNotBlank() &&
+                            comment.authorId.equals(post.authorId, ignoreCase = true)
+                    comment.copy(isMyComment = isMyComment, isAuthor = isAuthor)
+                }.distinctBy { it.id }
+                post.copy(isMyPost = isMyPost, comments = mappedComments)
+            }.distinctBy { it.id }
+        }
+        vault.reevaluatePostsOwnership(if (isValidUser) cleanId else "")
+    }
+
     private fun subscribeToCloudPosts() {
         repositoryScope.launch {
             try {
                 firestoreService.observePosts().collect { cloudPosts ->
                     if (cloudPosts.isNotEmpty()) {
-                        val currentUserId = _currentUser.value.id
+                        val cleanUserId = _currentUser.value.id.trim().lowercase()
+                        val isValidUser = _isLoggedIn.value && cleanUserId.isNotBlank() && cleanUserId != "user_me_anon"
                         val mapped = cloudPosts.map { post ->
-                            val isMyPost = (post.authorId.isNotBlank() && post.authorId == currentUserId) || post.isMyPost
+                            val isMyPost = isValidUser && post.authorId.isNotBlank() &&
+                                    !post.authorId.equals("user_me_anon", ignoreCase = true) &&
+                                    post.authorId.equals(cleanUserId, ignoreCase = true)
                             val mappedComments = post.comments.map { comment ->
-                                val isMyComment = (comment.authorId.isNotBlank() && comment.authorId == currentUserId) || comment.isMyComment
-                                comment.copy(isMyComment = isMyComment)
-                            }
+                                val isMyComment = isValidUser && comment.authorId.isNotBlank() &&
+                                        !comment.authorId.equals("user_me_anon", ignoreCase = true) &&
+                                        comment.authorId.equals(cleanUserId, ignoreCase = true)
+                                val isAuthor = post.authorId.isNotBlank() && comment.authorId.isNotBlank() &&
+                                        comment.authorId.equals(post.authorId, ignoreCase = true)
+                                comment.copy(isMyComment = isMyComment, isAuthor = isAuthor)
+                            }.distinctBy { it.id }
+                            val currentLocalPost = _posts.value.firstOrNull { it.id == post.id }
+                            val maxViews = maxOf(post.viewsCount, currentLocalPost?.viewsCount ?: 0)
                             post.copy(
                                 isMyPost = isMyPost,
-                                comments = mappedComments
+                                comments = mappedComments,
+                                commentsCount = mappedComments.size,
+                                viewsCount = maxViews
                             )
-                        }
+                        }.distinctBy { it.id }
                         _posts.value = mapped
                     }
                 }
@@ -196,6 +231,7 @@ class AppRepository {
             _currentUser.value = vaultUser
             _isLoggedIn.value = true
             _chatRooms.value = emptyList()
+            reevaluatePostsOwnership(vaultUser.id)
             return
         }
 
@@ -255,6 +291,7 @@ class AppRepository {
     fun saveUserSession(user: UserProfile) {
         // 1. 다중 로컬 영구 금고에 즉시 보존
         vault.saveSession(user)
+        reevaluatePostsOwnership(user.id)
 
         // 2. SharedPreferences에도 즉시 커밋
         val sp = prefs ?: return
@@ -288,6 +325,52 @@ class AppRepository {
             .putBoolean("user_is_gender_visible", user.isGenderVisible)
             .putStringSet("all_saved_ids_set", currentSet)
             .commit()
+
+        // 3. 클라우드(REST + Firestore)에도 활성 세션 비동기 보존
+        if (user.id.isNotBlank() && user.id != "user_me_anon") {
+            repositoryScope.launch {
+                try {
+                    firestoreService.saveSessionInCloud(user)
+                } catch (e: Exception) {
+                    Log.w("AppRepository", "Cloud session sync notice: ${e.message}")
+                }
+            }
+        }
+    }
+
+    /**
+     * 클라우드 동기화 서버로부터 전체 계정 및 마지막 세션 복원
+     */
+    fun syncCloudAccountsAndSession(onComplete: ((Boolean) -> Unit)? = null) {
+        repositoryScope.launch {
+            try {
+                val syncResult = firestoreService.syncAllAccountsAndSession()
+                val restoredUser = syncResult.lastSessionUser
+
+                // 로컬 세션이 없거나 기본 익명 유저인데, 클라우드에 유효한 세션이 복원된 경우 즉시 자동 로그인!
+                if ((!_isLoggedIn.value || _currentUser.value.id == "user_me_anon") && restoredUser != null && restoredUser.id != "user_me_anon") {
+                    _currentUser.value = restoredUser
+                    _isLoggedIn.value = true
+                    _chatRooms.value = emptyList()
+                    vault.saveSession(restoredUser)
+                    reevaluatePostsOwnership(restoredUser.id)
+                    subscribeToCurrentUserProfile()
+                    Log.d("AppRepository", "Auto-restored cloud session for ${restoredUser.id}")
+                }
+                onComplete?.invoke(true)
+            } catch (e: Exception) {
+                Log.w("AppRepository", "syncCloudAccounts notice: ${e.message}")
+                onComplete?.invoke(false)
+            }
+        }
+    }
+
+    /**
+     * 로컬 금고/설정에 저장된 계정 비밀번호 조회 (빠른 자동완성 로그인용)
+     */
+    fun getSavedAccountPassword(id: String): String? {
+        val cleanId = id.trim().lowercase()
+        return vault.getAccountPassword(cleanId) ?: prefs?.getString("acc_pwd_$cleanId", null)
     }
 
     // 이미 가입된 Google 계정인지 확인
@@ -473,18 +556,25 @@ class AppRepository {
             try {
                 val cloudPosts = firestoreService.fetchPosts()
                 if (cloudPosts.isNotEmpty()) {
-                    val currentUserId = _currentUser.value.id
+                    val cleanUserId = _currentUser.value.id.trim().lowercase()
+                    val isValidUser = _isLoggedIn.value && cleanUserId.isNotBlank() && cleanUserId != "user_me_anon"
                     val mapped = cloudPosts.map { post ->
-                        val isMyPost = (post.authorId.isNotBlank() && post.authorId == currentUserId) || post.isMyPost
+                        val isMyPost = isValidUser && post.authorId.isNotBlank() &&
+                                !post.authorId.equals("user_me_anon", ignoreCase = true) &&
+                                post.authorId.equals(cleanUserId, ignoreCase = true)
                         val mappedComments = post.comments.map { comment ->
-                            val isMyComment = (comment.authorId.isNotBlank() && comment.authorId == currentUserId) || comment.isMyComment
-                            comment.copy(isMyComment = isMyComment)
-                        }
+                            val isMyComment = isValidUser && comment.authorId.isNotBlank() &&
+                                    !comment.authorId.equals("user_me_anon", ignoreCase = true) &&
+                                    comment.authorId.equals(cleanUserId, ignoreCase = true)
+                            val isAuthor = post.authorId.isNotBlank() && comment.authorId.isNotBlank() &&
+                                    comment.authorId.equals(post.authorId, ignoreCase = true)
+                            comment.copy(isMyComment = isMyComment, isAuthor = isAuthor)
+                        }.distinctBy { it.id }
                         post.copy(
                             isMyPost = isMyPost,
                             comments = mappedComments
                         )
-                    }
+                    }.distinctBy { it.id }
                     _posts.value = mapped
                 }
             } catch (e: Exception) {
@@ -537,8 +627,9 @@ class AppRepository {
         }
     }
 
-    // 게시글 조회수 증가
+    // 게시글 조회수 증가 (로컬 금고 즉시 저장 및 화면 반영 + 서버 동기화)
     fun incrementPostViews(postId: String) {
+        vault.incrementPostViews(postId)
         _posts.update { list ->
             list.map { post ->
                 if (post.id == postId) post.copy(viewsCount = post.viewsCount + 1) else post
@@ -567,7 +658,7 @@ class AppRepository {
 
         // "000한 글쓰니" 형태의 랜덤 익명 닉네임 생성
         val authorName = customAuthorTag?.takeIf { it.isNotBlank() } ?: AnonymousNameGenerator.generatePostAuthorName()
-        val currentUserId = _currentUser.value.id
+        val currentUserId = _currentUser.value.id.trim().lowercase()
 
         val newPost = Post(
             category = category,
@@ -586,7 +677,7 @@ class AppRepository {
 
         // 1. 다중 로컬 금고에 즉시 100% 영구 저장 (앱 재부팅/재설치 시에도 보존)
         vault.saveUserCreatedPost(newPost)
-        _posts.update { listOf(newPost) + it }
+        _posts.update { list -> (listOf(newPost) + list).distinctBy { it.id } }
 
         // 2. 클라우드 서버 비동기 전송
         repositoryScope.launch {
@@ -601,24 +692,32 @@ class AppRepository {
     fun addComment(postId: String, content: String, customAuthorTag: String? = null) {
         val filterResult = SafetyTextFilter.maskSensitiveContent(content)
         val targetPost = _posts.value.firstOrNull { it.id == postId }
-        val isAuthor = targetPost?.isMyPost == true
-        val currentUserId = _currentUser.value.id
+        val currentUserId = _currentUser.value.id.trim().lowercase()
+        val isLoggedInNow = _isLoggedIn.value && currentUserId.isNotBlank() && currentUserId != "user_me_anon"
+
+        // 글 작성자 본인 여부: targetPost의 authorId와 현재 로그인 사용자의 id가 유효하고 정확히 일치할 때만 true!
+        val isAuthor = isLoggedInNow && targetPost != null &&
+                targetPost.authorId.isNotBlank() &&
+                !targetPost.authorId.equals("user_me_anon", ignoreCase = true) &&
+                targetPost.authorId.equals(currentUserId, ignoreCase = true)
 
         // 닉네임 결정:
-        // 1. 내가 쓴 글에 댓글을 달 때는 해당 게시글의 작성자 이름(예: '000 글쓰니')과 동일하게 유지
-        // 2. 다른 글인 경우: 한 게시글마다 고유한 익명 닉을 새로 정하고, 같은 글에 여러 댓글을 달면 동일한 익명 닉 유지
+        // 1. 글 작성자 본인이 댓글을 달 때는 해당 게시글의 작성자 이름(예: '000 글쓰니')과 동일하게 유지
+        // 2. 타인 글인 경우: 한 게시글마다 사용자별 고유한 익명 닉을 새로 정하고, 같은 글에 여러 댓글을 달면 동일한 익명 닉 유지
+        val commentKey = "${currentUserId}_$postId"
         val commentAuthor = when {
             isAuthor -> targetPost?.authorTag ?: "글쓰니"
             customAuthorTag?.isNotBlank() == true -> customAuthorTag
             else -> {
-                val existingTag = targetPost?.comments?.firstOrNull { it.isMyComment && !it.isAuthor }?.authorTag
-                    ?: myCommentNicknamesByPost[postId]
+                val existingTag = targetPost?.comments?.firstOrNull {
+                    it.authorId.isNotBlank() && it.authorId.equals(currentUserId, ignoreCase = true) && !it.isAuthor
+                }?.authorTag ?: myCommentNicknamesByPost[commentKey]
 
                 if (existingTag != null) {
                     existingTag
                 } else {
                     val newTag = AnonymousNameGenerator.generateCommentAuthorName(isAuthor = false)
-                    myCommentNicknamesByPost[postId] = newTag
+                    myCommentNicknamesByPost[commentKey] = newTag
                     newTag
                 }
             }
@@ -630,19 +729,20 @@ class AppRepository {
             content = filterResult.filteredText,
             timeAgo = "방금 전",
             isAuthor = isAuthor,
-            isMyComment = true,
+            isMyComment = isLoggedInNow,
             authorId = currentUserId,
             createdAt = System.currentTimeMillis()
         )
 
-        // 1. 다중 로컬 금고에 영구 저장
+        // 1. 다중 로컬 금고에 영구 저장 (중복 방지 및 댓글 수 정확 갱신)
         vault.addLocalComment(postId, newComment)
         _posts.update { list ->
             list.map { post ->
                 if (post.id == postId) {
+                    val distinctComments = (post.comments + newComment).distinctBy { it.id }
                     post.copy(
-                        commentsCount = post.commentsCount + 1,
-                        comments = post.comments + newComment
+                        commentsCount = distinctComments.size,
+                        comments = distinctComments
                     )
                 } else post
             }
@@ -655,7 +755,15 @@ class AppRepository {
     }
 
     // 내가 쓴 익명 게시글 삭제
-    fun deletePost(postId: String) {
+    fun deletePost(postId: String): Boolean {
+        val currentUserId = _currentUser.value.id.trim().lowercase()
+        val target = _posts.value.firstOrNull { it.id == postId } ?: return false
+        // 작성자 본인만 삭제 가능하도록 엄격 검증
+        if (!_isLoggedIn.value || currentUserId.isBlank() || currentUserId == "user_me_anon" ||
+            !target.authorId.equals(currentUserId, ignoreCase = true)) {
+            Log.w("AppRepository", "Unauthorized deletePost attempt by $currentUserId for post author ${target.authorId}")
+            return false
+        }
         vault.deleteLocalPost(postId)
         _posts.update { list ->
             list.filterNot { it.id == postId }
@@ -663,10 +771,20 @@ class AppRepository {
         repositoryScope.launch {
             firestoreService.deletePost(postId)
         }
+        return true
     }
 
     // 내가 쓴 익명 댓글 삭제
-    fun deleteComment(postId: String, commentId: String) {
+    fun deleteComment(postId: String, commentId: String): Boolean {
+        val currentUserId = _currentUser.value.id.trim().lowercase()
+        val targetPost = _posts.value.firstOrNull { it.id == postId } ?: return false
+        val targetComment = targetPost.comments.firstOrNull { it.id == commentId } ?: return false
+        // 작성자 본인만 댓글 삭제 가능하도록 엄격 검증
+        if (!_isLoggedIn.value || currentUserId.isBlank() || currentUserId == "user_me_anon" ||
+            !targetComment.authorId.equals(currentUserId, ignoreCase = true)) {
+            Log.w("AppRepository", "Unauthorized deleteComment attempt")
+            return false
+        }
         _posts.update { list ->
             list.map { post ->
                 if (post.id == postId) {
@@ -681,6 +799,7 @@ class AppRepository {
         repositoryScope.launch {
             firestoreService.deleteComment(postId, commentId)
         }
+        return true
     }
 
     // 채팅 메시지 전송 (실시간 마스킹 처리)
@@ -807,8 +926,24 @@ class AppRepository {
 
     private fun seedInitialPosts() {
         // 로컬 영구 금고에서 기본 제공 및 저장된 글 목록 로드 (앱 재부팅/재설치 시에도 즉시 표시)
-        val initialPosts = vault.getLocalPosts()
-        _posts.value = initialPosts
+        val initialPosts = vault.getLocalPosts().distinctBy { it.id }
+        val currentId = _currentUser.value.id.trim().lowercase()
+        val isValidUser = _isLoggedIn.value && currentId.isNotBlank() && currentId != "user_me_anon"
+        val evaluated = initialPosts.map { post ->
+            val isMyPost = isValidUser && post.authorId.isNotBlank() &&
+                    !post.authorId.equals("user_me_anon", ignoreCase = true) &&
+                    post.authorId.equals(currentId, ignoreCase = true)
+            val mappedComments = post.comments.map { comment ->
+                val isMyComment = isValidUser && comment.authorId.isNotBlank() &&
+                        !comment.authorId.equals("user_me_anon", ignoreCase = true) &&
+                        comment.authorId.equals(currentId, ignoreCase = true)
+                val isAuthor = post.authorId.isNotBlank() && comment.authorId.isNotBlank() &&
+                        comment.authorId.equals(post.authorId, ignoreCase = true)
+                comment.copy(isMyComment = isMyComment, isAuthor = isAuthor)
+            }.distinctBy { it.id }
+            post.copy(isMyPost = isMyPost, comments = mappedComments)
+        }.distinctBy { it.id }
+        _posts.value = evaluated
     }
 
     private fun seedInitialChats() {
@@ -1323,20 +1458,116 @@ class AppRepository {
     // 로그아웃
     fun logout() {
         _isLoggedIn.value = false
+        _currentUser.value = defaultDemoUser
         _chatRooms.value = emptyList()
         userProfileJob?.cancel()
         accountObservationJob?.cancel()
+        myCommentNicknamesByPost.clear()
         prefs?.edit()?.putBoolean("is_logged_in", false)?.apply()
+        vault.logoutSession()
+        reevaluatePostsOwnership("")
     }
 
-    // 회원 탈퇴
+    // 회원 탈퇴: 계정 및 프로필, 게시글, 세션, 저장된 아이디 완전 삭제
     fun deleteAccount() {
+        val currentId = _currentUser.value.id.trim().lowercase()
         _isLoggedIn.value = false
         _currentUser.value = defaultDemoUser
         _chatRooms.value = emptyList()
         userProfileJob?.cancel()
         accountObservationJob?.cancel()
-        prefs?.edit()?.clear()?.apply()
+        myCommentNicknamesByPost.clear()
+
+        // 1. 다중 로컬 영구 금고에서 계정, 비밀번호, 세션, 작성글 완전 삭제
+        if (currentId.isNotBlank()) {
+            vault.deleteAccount(currentId)
+        }
+
+        // 2. SharedPreferences에서 계정 및 로그인 세션 완전 삭제
+        val sp = prefs
+        if (sp != null) {
+            val editor = sp.edit()
+            if (currentId.isNotBlank()) {
+                val set = sp.getStringSet("all_saved_ids_set", emptySet())?.toMutableSet() ?: mutableSetOf()
+                set.remove(currentId)
+                editor.putStringSet("all_saved_ids_set", set)
+                val lastUsed = sp.getString("last_used_id", "") ?: ""
+                if (lastUsed.equals(currentId, ignoreCase = true)) {
+                    editor.putString("last_used_id", set.firstOrNull() ?: "")
+                }
+                editor.remove("acc_pwd_$currentId")
+                editor.remove("acc_nick_$currentId")
+                editor.remove("acc_gender_$currentId")
+                editor.remove("acc_birth_$currentId")
+                editor.remove("acc_age_$currentId")
+                editor.remove("acc_bio_$currentId")
+                editor.remove("acc_personality_$currentId")
+                editor.remove("acc_interests_$currentId")
+                editor.remove("acc_friend_style_$currentId")
+                editor.remove("acc_special_notes_$currentId")
+                editor.remove("acc_age_visible_$currentId")
+                editor.remove("acc_gender_visible_$currentId")
+                editor.remove("acc_avatar_res_$currentId")
+                editor.remove("acc_avatar_uri_$currentId")
+                editor.remove("acc_hearts_$currentId")
+                editor.remove("acc_views_$currentId")
+                editor.remove("reg_id_$currentId")
+            }
+            editor.putBoolean("is_logged_in", false)
+            editor.remove("user_id")
+            editor.remove("user_nickname")
+            editor.remove("user_age")
+            editor.remove("user_birth_year")
+            editor.remove("user_gender")
+            editor.remove("user_bio")
+            editor.remove("user_mbti")
+            editor.remove("user_interests")
+            editor.remove("user_google_email")
+            editor.remove("user_phone")
+            editor.remove("user_avatar_res_id")
+            editor.remove("user_avatar_uri")
+            editor.remove("user_heart_balance")
+            editor.remove("user_profile_views")
+            editor.remove("user_personality")
+            editor.remove("user_preferred_friend_style")
+            editor.remove("user_special_notes")
+            editor.remove("user_is_age_visible")
+            editor.remove("user_is_gender_visible")
+            editor.commit()
+        }
+
+        // 3. 내가 작성한 피드 글 즉시 제거 및 남은 글들의 소유권 해제
+        _posts.update { list ->
+            list.filterNot { currentId.isNotBlank() && it.authorId.equals(currentId, ignoreCase = true) }
+                .map { it.copy(isMyPost = false, comments = it.comments.map { c -> c.copy(isMyComment = false, isAuthor = false) }) }
+        }
+        vault.logoutSession()
+
+        // 4. 클라우드 서버(Firestore 및 REST 동기화 서버)에서 계정 영구 삭제
+        if (currentId.isNotBlank()) {
+            repositoryScope.launch {
+                try {
+                    firestoreService.deleteAccountFromCloud(currentId)
+                } catch (e: Exception) {
+                    Log.w("AppRepository", "Failed to delete account from cloud: ${e.message}")
+                }
+            }
+        }
+    }
+
+    // 저장된 아이디 목록에서 특정 아이디만 제거하는 함수
+    fun removeSavedId(id: String) {
+        val clean = id.trim().lowercase()
+        vault.removeSavedId(clean)
+        val sp = prefs ?: return
+        val set = sp.getStringSet("all_saved_ids_set", emptySet())?.toMutableSet() ?: mutableSetOf()
+        set.remove(clean)
+        val lastUsed = sp.getString("last_used_id", "") ?: ""
+        val newLast = if (lastUsed.equals(clean, ignoreCase = true)) set.firstOrNull() ?: "" else lastUsed
+        sp.edit()
+            .putStringSet("all_saved_ids_set", set)
+            .putString("last_used_id", newLast)
+            .commit()
     }
 
     // 설정 변경

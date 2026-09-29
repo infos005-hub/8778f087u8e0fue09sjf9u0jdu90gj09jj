@@ -27,11 +27,11 @@ class AnonApplication : Application() {
                 } catch (e: Exception) {
                     // 2차: OAuth / firebase-applet-config 실제 프로젝트 옵션으로 초기화
                     val options = FirebaseOptions.Builder()
-                        .setApplicationId("1:1092083628930:android:com.aistudio.anon.socmat")
-                        .setApiKey("AIzaSyDNCP8FLwoFTX-mS4dPteh9IHpJOdPXyj0")
-                        .setProjectId("gen-lang-client-0495888999")
-                        .setGcmSenderId("1092083628930")
-                        .setStorageBucket("gen-lang-client-0495888999.firebasestorage.app")
+                        .setApplicationId("1:768097478635:android:71212dbb7e992e04ab9bae")
+                        .setApiKey("AIzaSyBpFN-x9_2jJatKOINxVW0f5g8dyMqt5pk")
+                        .setProjectId("anon-3299a")
+                        .setGcmSenderId("768097478635")
+                        .setStorageBucket("anon-3299a.firebasestorage.app")
                         .build()
                     FirebaseApp.initializeApp(this, options)
                     Log.d("AnonApplication", "FirebaseApp initialized with verified FirebaseOptions")

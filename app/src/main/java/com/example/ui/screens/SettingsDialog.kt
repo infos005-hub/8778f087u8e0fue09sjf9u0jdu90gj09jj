@@ -1,5 +1,6 @@
 package com.example.ui.screens
 
+import android.widget.Toast
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -18,6 +19,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -31,6 +33,7 @@ fun SettingsDialog(
     onDismiss: () -> Unit,
     onLogout: () -> Unit
 ) {
+    val context = LocalContext.current
     val currentUser by repository.currentUser.collectAsState()
     val settings by repository.settings.collectAsState()
     val blockedIds by repository.blockedUserIds.collectAsState()
@@ -375,20 +378,59 @@ fun SettingsDialog(
         )
     }
 
-    // 회원 탈퇴 확인 팝업
+    // 회원 탈퇴 주의사항 경고 팝업
     if (showDeleteAccountConfirm) {
         AlertDialog(
             onDismissRequest = { showDeleteAccountConfirm = false },
             containerColor = Color.White,
+            shape = RoundedCornerShape(20.dp),
             title = {
-                Text("정말 탈퇴하시겠습니까?", color = AnonError, fontWeight = FontWeight.Bold, fontSize = 17.sp)
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(
+                        imageVector = Icons.Default.Warning,
+                        contentDescription = null,
+                        tint = AnonError,
+                        modifier = Modifier.size(24.dp)
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text(
+                        text = "회원 탈퇴 주의사항 경고",
+                        color = AnonError,
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 18.sp
+                    )
+                }
             },
             text = {
-                Text(
-                    "탈퇴 시 작성한 게시글 및 채팅 기록, 보유 하트가 모두 초기화됩니다.",
-                    color = AnonTextSecondary,
-                    fontSize = 13.sp
-                )
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Text(
+                        text = "탈퇴 시 모든 정보가 영구 삭제되며 복구할 수 없습니다.",
+                        color = AnonTextPrimary,
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 14.sp
+                    )
+                    Surface(
+                        color = AnonError.copy(alpha = 0.08f),
+                        shape = RoundedCornerShape(12.dp),
+                        border = androidx.compose.foundation.BorderStroke(1.dp, AnonError.copy(alpha = 0.25f)),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Column(
+                            modifier = Modifier.padding(12.dp),
+                            verticalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            Text("• 작성한 모든 익명 게시글 및 댓글 영구 삭제", fontSize = 12.sp, color = AnonTextPrimary)
+                            Text("• 참여 중인 모든 대화방 및 메시지 내역 즉시 파기", fontSize = 12.sp, color = AnonTextPrimary)
+                            Text("• 보유 하트 잔여량 및 프로필 설정 정보 완전 소멸", fontSize = 12.sp, color = AnonTextPrimary)
+                            Text("• 탈퇴 완료 후에는 계정을 절대 복구할 수 없습니다.", fontSize = 12.sp, color = AnonError, fontWeight = FontWeight.Bold)
+                        }
+                    }
+                    Text(
+                        text = "정말로 모든 데이터를 삭제하고 탈퇴하시겠습니까?",
+                        color = AnonTextSecondary,
+                        fontSize = 13.sp
+                    )
+                }
             },
             confirmButton = {
                 Button(
@@ -396,15 +438,20 @@ fun SettingsDialog(
                         showDeleteAccountConfirm = false
                         onDismiss()
                         repository.deleteAccount()
+                        Toast.makeText(context, "회원 탈퇴가 완료되어 모든 정보가 영구 삭제되었습니다.", Toast.LENGTH_SHORT).show()
                         onLogout()
                     },
-                    colors = ButtonDefaults.buttonColors(containerColor = AnonError)
+                    colors = ButtonDefaults.buttonColors(containerColor = AnonError),
+                    shape = RoundedCornerShape(12.dp)
                 ) {
-                    Text("탈퇴하기", color = Color.White, fontWeight = FontWeight.Bold)
+                    Text("경고 확인 및 탈퇴", color = Color.White, fontWeight = FontWeight.Bold)
                 }
             },
             dismissButton = {
-                TextButton(onClick = { showDeleteAccountConfirm = false }) {
+                OutlinedButton(
+                    onClick = { showDeleteAccountConfirm = false },
+                    shape = RoundedCornerShape(12.dp)
+                ) {
                     Text("취소", color = AnonTextSecondary)
                 }
             }

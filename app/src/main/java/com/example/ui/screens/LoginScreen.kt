@@ -69,13 +69,54 @@ fun LoginScreen(
 
     // 저장된 아이디 목록 및 마지막 사용 아이디
     val lastSavedId = remember { repository.getLastSavedId() }
-    val initialSavedIds = remember { repository.getAllSavedIds() }
+    val initialSavedIds = remember { repository.getAllSavedIds().distinct() }
     var savedIdList by remember { mutableStateOf(initialSavedIds) }
     var rememberId by remember { mutableStateOf(repository.isRememberIdEnabled()) }
 
     // 저장된 아이디가 있다면 기본으로 로그인 화면을 띄우고, 없으면 아이디 만들기 화면을 띄움
     var authMode by remember {
         mutableStateOf(if (lastSavedId.isNotBlank()) AuthMode.LOGIN else AuthMode.CREATE_ACCOUNT)
+    }
+
+    // [로그인 필드 상태]
+    var loginId by remember { mutableStateOf(lastSavedId) }
+    var loginPassword by remember { mutableStateOf(repository.getSavedAccountPassword(lastSavedId) ?: "") }
+    var isLoginPasswordVisible by remember { mutableStateOf(false) }
+    var isSyncingCloud by remember { mutableStateOf(false) }
+
+    LaunchedEffect(Unit) {
+        val currentSaved = repository.getAllSavedIds().distinct()
+        savedIdList = currentSaved
+        val currentLast = repository.getLastSavedId()
+        if (currentLast.isNotBlank()) {
+            loginId = currentLast
+            repository.getSavedAccountPassword(currentLast)?.let { loginPassword = it }
+            authMode = AuthMode.LOGIN
+        } else if (currentSaved.isNotEmpty()) {
+            val first = currentSaved.first()
+            loginId = first
+            repository.getSavedAccountPassword(first)?.let { loginPassword = it }
+            authMode = AuthMode.LOGIN
+        } else {
+            authMode = AuthMode.CREATE_ACCOUNT
+            loginId = ""
+        }
+
+        // 앱 재빌드/업그레이드/재설치 시에도 계정 정보가 즉시 복원되도록 클라우드 백그라운드 자동 동기화
+        isSyncingCloud = true
+        repository.syncCloudAccountsAndSession { success ->
+            isSyncingCloud = false
+            val refreshed = repository.getAllSavedIds().distinct()
+            if (refreshed.isNotEmpty()) {
+                savedIdList = refreshed
+                if (loginId.isBlank()) {
+                    val newLast = repository.getLastSavedId().ifBlank { refreshed.first() }
+                    loginId = newLast
+                    repository.getSavedAccountPassword(newLast)?.let { loginPassword = it }
+                    authMode = AuthMode.LOGIN
+                }
+            }
+        }
     }
 
     // [아이디 만들기 필드 상태]
@@ -112,11 +153,6 @@ fun LoginScreen(
     var duplicateCheckResult by remember { mutableStateOf<AppRepository.IdAvailabilityResult?>(null) }
     var isRegistering by remember { mutableStateOf(false) }
     var isLoggingIn by remember { mutableStateOf(false) }
-
-    // [로그인 필드 상태]
-    var loginId by remember { mutableStateOf(lastSavedId) }
-    var loginPassword by remember { mutableStateOf("") }
-    var isLoginPasswordVisible by remember { mutableStateOf(false) }
 
     // 에러 메시지
     var errorMessage by remember { mutableStateOf<String?>(null) }
@@ -477,6 +513,56 @@ fun LoginScreen(
                             }
                         }
 
+                        // 저장된 기존 계정이 있을 때 빠른 로그인 안내 배너 (앱 수정/업그레이드 후 빠른 복구)
+                        if (savedIdList.isNotEmpty()) {
+                            Surface(
+                                color = AnonPrimary.copy(alpha = 0.08f),
+                                shape = RoundedCornerShape(12.dp),
+                                border = androidx.compose.foundation.BorderStroke(1.dp, AnonPrimary.copy(alpha = 0.25f)),
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clickable {
+                                        authMode = AuthMode.LOGIN
+                                        val target = savedIdList.first()
+                                        loginId = target
+                                        repository.getSavedAccountPassword(target)?.let { loginPassword = it }
+                                    }
+                            ) {
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp)
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Default.AccountCircle,
+                                        contentDescription = null,
+                                        tint = AnonPrimary,
+                                        modifier = Modifier.size(24.dp)
+                                    )
+                                    Spacer(modifier = Modifier.width(10.dp))
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Text(
+                                            text = "저장된 기존 계정 발견 (${savedIdList.size}개)",
+                                            fontSize = 12.sp,
+                                            fontWeight = FontWeight.Bold,
+                                            color = AnonPrimary
+                                        )
+                                        Text(
+                                            text = "아이디 [${savedIdList.joinToString(", ")}] (탭하여 바로 로그인)",
+                                            fontSize = 11.sp,
+                                            color = AnonTextSecondary
+                                        )
+                                    }
+                                    Icon(
+                                        imageVector = Icons.Default.ArrowForwardIos,
+                                        contentDescription = null,
+                                        tint = AnonPrimary,
+                                        modifier = Modifier.size(13.dp)
+                                    )
+                                }
+                            }
+                            Spacer(modifier = Modifier.height(14.dp))
+                        }
+
                         // 아이디 입력 라벨
                         Text(
                             text = "아이디 (필수)",
@@ -609,20 +695,37 @@ fun LoginScreen(
                                         Surface(
                                             color = AnonSurfaceElevated,
                                             shape = RoundedCornerShape(8.dp),
-                                            border = androidx.compose.foundation.BorderStroke(1.dp, AnonSurfaceBorderStrong),
-                                            modifier = Modifier.clickable {
-                                                registerId = sid
-                                                duplicateCheckResult = null
-                                                errorMessage = null
-                                            }
+                                            border = androidx.compose.foundation.BorderStroke(1.dp, AnonSurfaceBorderStrong)
                                         ) {
-                                            Text(
-                                                text = sid,
-                                                fontSize = 11.sp,
-                                                color = AnonPrimary,
-                                                fontWeight = FontWeight.SemiBold,
+                                            Row(
+                                                verticalAlignment = Alignment.CenterVertically,
                                                 modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp)
-                                            )
+                                            ) {
+                                                Text(
+                                                    text = sid,
+                                                    fontSize = 11.sp,
+                                                    color = AnonPrimary,
+                                                    fontWeight = FontWeight.SemiBold,
+                                                    modifier = Modifier.clickable {
+                                                        registerId = sid
+                                                        duplicateCheckResult = null
+                                                        errorMessage = null
+                                                    }
+                                                )
+                                                Spacer(modifier = Modifier.width(4.dp))
+                                                Icon(
+                                                    imageVector = Icons.Default.Close,
+                                                    contentDescription = "아이디 삭제",
+                                                    tint = AnonTextMuted,
+                                                    modifier = Modifier
+                                                        .size(13.dp)
+                                                        .clickable {
+                                                            repository.removeSavedId(sid)
+                                                            savedIdList = repository.getAllSavedIds()
+                                                            if (registerId == sid) registerId = ""
+                                                        }
+                                                )
+                                            }
                                         }
                                     }
                                 }
@@ -1511,19 +1614,42 @@ fun LoginScreen(
                                             border = androidx.compose.foundation.BorderStroke(
                                                 1.dp,
                                                 if (loginId == sid) AnonPrimary else AnonSurfaceBorderStrong
-                                            ),
-                                            modifier = Modifier.clickable {
-                                                loginId = sid
-                                                errorMessage = null
-                                            }
-                                        ) {
-                                            Text(
-                                                text = sid,
-                                                fontSize = 11.sp,
-                                                color = if (loginId == sid) AnonPrimary else AnonTextPrimary,
-                                                fontWeight = FontWeight.SemiBold,
-                                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp)
                                             )
+                                        ) {
+                                            Row(
+                                                verticalAlignment = Alignment.CenterVertically,
+                                                modifier = Modifier.padding(start = 8.dp, end = 4.dp, top = 3.dp, bottom = 3.dp)
+                                            ) {
+                                                Text(
+                                                    text = sid,
+                                                    fontSize = 11.sp,
+                                                    color = if (loginId == sid) AnonPrimary else AnonTextPrimary,
+                                                    fontWeight = FontWeight.SemiBold,
+                                                    modifier = Modifier.clickable {
+                                                        loginId = sid
+                                                        repository.getSavedAccountPassword(sid)?.let { pwd ->
+                                                            loginPassword = pwd
+                                                        }
+                                                        errorMessage = null
+                                                    }
+                                                )
+                                                Spacer(modifier = Modifier.width(4.dp))
+                                                Icon(
+                                                    imageVector = Icons.Default.Close,
+                                                    contentDescription = "아이디 삭제",
+                                                    tint = AnonTextMuted,
+                                                    modifier = Modifier
+                                                        .size(13.dp)
+                                                        .clickable {
+                                                            repository.removeSavedId(sid)
+                                                            val updated = repository.getAllSavedIds()
+                                                            savedIdList = updated
+                                                            if (loginId == sid) {
+                                                                loginId = updated.firstOrNull() ?: ""
+                                                            }
+                                                        }
+                                                )
+                                            }
                                         }
                                     }
                                 }
@@ -1646,6 +1772,62 @@ fun LoginScreen(
                                     color = Color.White,
                                     fontSize = 15.sp,
                                     fontWeight = FontWeight.Bold
+                                )
+                            }
+                        }
+
+                        Spacer(modifier = Modifier.height(10.dp))
+
+                        // 클라우드 계정 정보 및 세션 복원 버튼
+                        OutlinedButton(
+                            onClick = {
+                                isSyncingCloud = true
+                                repository.syncCloudAccountsAndSession { success ->
+                                    isSyncingCloud = false
+                                    savedIdList = repository.getAllSavedIds().distinct()
+                                    val last = repository.getLastSavedId().ifBlank { savedIdList.firstOrNull() ?: "" }
+                                    if (last.isNotBlank()) {
+                                        loginId = last
+                                        repository.getSavedAccountPassword(last)?.let { loginPassword = it }
+                                    }
+                                    val count = savedIdList.size
+                                    Toast.makeText(
+                                        context,
+                                        if (count > 0) "☁️ 클라우드 및 영구 금고에서 계정 ${count}개를 복원했습니다." else "클라우드 계정 동기화를 완료했습니다.",
+                                        Toast.LENGTH_SHORT
+                                    ).show()
+                                }
+                            },
+                            enabled = !isSyncingCloud,
+                            shape = RoundedCornerShape(12.dp),
+                            border = androidx.compose.foundation.BorderStroke(1.dp, AnonSurfaceBorderStrong),
+                            colors = ButtonDefaults.outlinedButtonColors(
+                                contentColor = AnonTextSecondary
+                            ),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(46.dp)
+                        ) {
+                            if (isSyncingCloud) {
+                                CircularProgressIndicator(
+                                    modifier = Modifier.size(16.dp),
+                                    strokeWidth = 2.dp,
+                                    color = AnonPrimary
+                                )
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Text("클라우드 계정 복원 중...", fontSize = 13.sp)
+                            } else {
+                                Icon(
+                                    imageVector = Icons.Default.CloudSync,
+                                    contentDescription = null,
+                                    tint = AnonPrimary,
+                                    modifier = Modifier.size(18.dp)
+                                )
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Text(
+                                    text = "클라우드 저장 계정 불러오기 / 복구",
+                                    fontSize = 13.sp,
+                                    fontWeight = FontWeight.Medium
                                 )
                             }
                         }

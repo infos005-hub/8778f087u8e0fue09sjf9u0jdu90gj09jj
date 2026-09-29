@@ -86,10 +86,17 @@ class CloudRestSyncService {
             // 현재 저장 대상 계정 추가/덮어쓰기
             accountsObj.put(cleanId, userToAccountJson(cleanId, password, profile))
 
+            val sessionObj = JSONObject().apply {
+                put("userId", cleanId)
+                put("isLoggedIn", true)
+                put("updatedAt", System.currentTimeMillis())
+            }
+
             val rootData = JSONObject().apply {
                 put("name", "anon_accounts_7785d9f8")
                 put("data", JSONObject().apply {
                     put("accounts", accountsObj)
+                    put("lastSession", sessionObj)
                 })
             }
             val success = putOrPatchStore(accountsStoreId, rootData.toString())
@@ -98,6 +105,35 @@ class CloudRestSyncService {
         } catch (e: Exception) {
             Log.e(TAG, "saveAccount network failed (locally safe): ${e.message}")
             true // 로컬에 이미 보존되었으므로 안전함
+        }
+    }
+
+    suspend fun saveSessionToCloud(user: UserProfile, password: String = ""): Boolean = withContext(Dispatchers.IO) {
+        val cleanId = user.id.trim().lowercase()
+        if (cleanId.isBlank() || cleanId == "user_me_anon") return@withContext false
+
+        try {
+            val accountsObj = fetchAllAccountsMap()
+            if (!accountsObj.has(cleanId)) {
+                val pwd = password.ifBlank { vaultManager.getAccountPassword(cleanId) ?: "" }
+                accountsObj.put(cleanId, userToAccountJson(cleanId, pwd, user))
+            }
+            val sessionObj = JSONObject().apply {
+                put("userId", cleanId)
+                put("isLoggedIn", true)
+                put("updatedAt", System.currentTimeMillis())
+            }
+            val rootData = JSONObject().apply {
+                put("name", "anon_accounts_7785d9f8")
+                put("data", JSONObject().apply {
+                    put("accounts", accountsObj)
+                    put("lastSession", sessionObj)
+                })
+            }
+            putOrPatchStore(accountsStoreId, rootData.toString())
+        } catch (e: Exception) {
+            Log.w(TAG, "saveSessionToCloud error: ${e.message}")
+            false
         }
     }
 
@@ -138,6 +174,29 @@ class CloudRestSyncService {
             putOrPatchStore(accountsStoreId, rootData.toString())
         } catch (e: Exception) {
             Log.e(TAG, "updateAccountProfile network failed: ${e.message}")
+            true
+        }
+    }
+
+    suspend fun deleteAccount(id: String): Boolean = withContext(Dispatchers.IO) {
+        val cleanId = id.trim().lowercase()
+        vaultManager.deleteAccount(cleanId)
+
+        try {
+            val accountsObj = fetchAllAccountsMap()
+            if (accountsObj.has(cleanId)) {
+                accountsObj.remove(cleanId)
+                val rootData = JSONObject().apply {
+                    put("name", "anon_accounts_7785d9f8")
+                    put("data", JSONObject().apply {
+                        put("accounts", accountsObj)
+                    })
+                }
+                putOrPatchStore(accountsStoreId, rootData.toString())
+            }
+            true
+        } catch (e: Exception) {
+            Log.e(TAG, "deleteAccount cloud failed: ${e.message}")
             true
         }
     }
@@ -250,6 +309,105 @@ class CloudRestSyncService {
         }
     }.flowOn(Dispatchers.IO)
 
+    data class CloudSyncResult(
+        val accounts: Map<String, Pair<String, UserProfile>>,
+        val lastSessionUser: UserProfile?,
+        val lastSessionPassword: String?
+    )
+
+    /**
+     * 클라우드 REST 서버로부터 전체 등록 계정 및 마지막 로그인 세션 통합 복원
+     */
+    suspend fun restoreAllAccountsAndSessionFromCloud(): CloudSyncResult = withContext(Dispatchers.IO) {
+        val accountsMap = mutableMapOf<String, Pair<String, UserProfile>>()
+        var lastSessionUser: UserProfile? = null
+        var lastSessionPassword: String? = null
+
+        try {
+            val request = Request.Builder()
+                .url("$BASE_URL/$accountsStoreId")
+                .header("User-Agent", USER_AGENT)
+                .header("Accept", "application/json")
+                .get()
+                .build()
+            val response = client.newCall(request).execute()
+            if (response.isSuccessful) {
+                val body = response.body?.string() ?: ""
+                response.close()
+                val jsonObj = JSONObject(body)
+                val dataObj = jsonObj.optJSONObject("data")
+                val cloudAccs = dataObj?.optJSONObject("accounts")
+                if (cloudAccs != null) {
+                    val keys = cloudAccs.keys()
+                    while (keys.hasNext()) {
+                        val key = keys.next().lowercase()
+                        val accObj = cloudAccs.optJSONObject(key) ?: continue
+                        val pwd = accObj.optString("password", "")
+                        val profile = parseUserProfileFromJson(key, accObj)
+                        accountsMap[key] = Pair(pwd, profile)
+                    }
+                }
+
+                // 로컬 금고에 전체 계정 즉시 병합 보존
+                if (accountsMap.isNotEmpty()) {
+                    vaultManager.mergeAccountsFromMap(accountsMap)
+                    Log.d(TAG, "Restored and merged ${accountsMap.size} cloud accounts into local vault")
+                }
+
+                val lastSessionObj = dataObj?.optJSONObject("lastSession")
+                val lastUserId = lastSessionObj?.optString("userId", "")?.lowercase() ?: ""
+                val isLoggedIn = lastSessionObj?.optBoolean("isLoggedIn", false) ?: false
+
+                if (isLoggedIn && lastUserId.isNotBlank() && accountsMap.containsKey(lastUserId)) {
+                    val pair = accountsMap[lastUserId]
+                    lastSessionUser = pair?.second
+                    lastSessionPassword = pair?.first
+                    if (lastSessionUser != null) {
+                        vaultManager.restoreSessionFromCloudUser(lastSessionUser)
+                        Log.d(TAG, "Restored active cloud user session: $lastUserId")
+                    }
+                }
+            } else {
+                response.close()
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "restoreAllAccountsAndSessionFromCloud error: ${e.message}")
+        }
+
+        CloudSyncResult(accountsMap, lastSessionUser, lastSessionPassword)
+    }
+
+    private fun parseUserProfileFromJson(id: String, acc: JSONObject): UserProfile {
+        val interestsList = mutableListOf<String>()
+        val interestsArr = acc.optJSONArray("interests")
+        if (interestsArr != null) {
+            for (i in 0 until interestsArr.length()) {
+                interestsList.add(interestsArr.optString(i))
+            }
+        }
+        return UserProfile(
+            id = id,
+            nickname = acc.optString("nickname", id),
+            age = acc.optInt("age", 24),
+            birthYear = acc.optInt("birthYear", 2002),
+            gender = acc.optString("gender", "여성"),
+            bio = acc.optString("bio", ""),
+            mbti = acc.optString("mbti", "INFP"),
+            photoUrls = emptyList(),
+            interests = if (interestsList.isNotEmpty()) interestsList else listOf("일상", "소통", "음악"),
+            avatarResId = acc.optInt("avatarResId", 0).let { if (it == 0) null else it },
+            avatarUri = acc.optString("avatarUri", "").takeIf { it.isNotBlank() },
+            personality = acc.optString("personality", "다정하고 긍정적인"),
+            preferredFriendStyle = acc.optString("preferredFriendStyle", "편하게 일상 나눌 친구"),
+            specialNotes = acc.optString("specialNotes", ""),
+            isAgeVisible = acc.optBoolean("isAgeVisible", true),
+            isGenderVisible = acc.optBoolean("isGenderVisible", true),
+            location = "서울",
+            heartBalance = acc.optInt("heartBalance", 20),
+            profileViews = acc.optInt("profileViews", 0)
+        )
+    }
+
     // -------------------------------------------------------------
     // 게시글 관리 (클라우드 저장 / 실시간 조회 / 댓글 / 추천 / 투표)
     // -------------------------------------------------------------
@@ -275,7 +433,7 @@ class CloudRestSyncService {
         }
 
         // 로컬 금고와 병합 (로컬 작성 글 및 기본 글이 절대 삭제되지 않도록 보장)
-        val mergedList = vaultManager.mergeCloudPosts(cloudPosts)
+        val mergedList = vaultManager.mergeCloudPosts(cloudPosts).distinctBy { it.id }
 
         // 만약 클라우드 글 목록이 비어있었다면 완전한 로컬 글 목록으로 클라우드에 자동 복구
         if (cloudPosts.isEmpty() && mergedList.isNotEmpty()) {
@@ -287,13 +445,13 @@ class CloudRestSyncService {
 
     fun observePosts(): Flow<List<Post>> = flow {
         // 즉시 로컬 금고 글 방출 (대기시간 0초)
-        val local = vaultManager.getLocalPosts()
+        val local = vaultManager.getLocalPosts().distinctBy { it.id }
         if (local.isNotEmpty()) {
             emit(local)
         }
 
         while (true) {
-            val list = fetchPosts()
+            val list = fetchPosts().distinctBy { it.id }
             if (list.isNotEmpty()) {
                 emit(list)
             }
@@ -320,7 +478,7 @@ class CloudRestSyncService {
     }
 
     suspend fun addComment(postId: String, comment: Comment): Boolean = withContext(Dispatchers.IO) {
-        // 1. 로컬 금고에 먼저 반영
+        // 1. 로컬 금고에 먼저 반영 (중복 제거 및 댓글 수 정확 계산)
         vaultManager.addLocalComment(postId, comment)
 
         try {
@@ -328,7 +486,7 @@ class CloudRestSyncService {
             val index = currentPosts.indexOfFirst { it.id == postId }
             if (index != -1) {
                 val target = currentPosts[index]
-                val updatedComments = target.comments + comment
+                val updatedComments = (target.comments + comment).distinctBy { it.id }
                 currentPosts[index] = target.copy(
                     comments = updatedComments,
                     commentsCount = updatedComments.size
@@ -398,6 +556,9 @@ class CloudRestSyncService {
     }
 
     suspend fun incrementViews(postId: String): Boolean = withContext(Dispatchers.IO) {
+        // 1. 로컬 금고에 즉각 갱신 및 파일 보존
+        vaultManager.incrementPostViews(postId)
+
         try {
             val currentPosts = fetchPosts().toMutableList()
             val index = currentPosts.indexOfFirst { it.id == postId }
@@ -555,7 +716,7 @@ class CloudRestSyncService {
         } catch (e: Exception) {
             Log.e(TAG, "parsePostsJson error: ${e.message}")
         }
-        return list
+        return list.distinctBy { it.id }
     }
 
     private fun savePostsList(posts: List<Post>): Boolean {

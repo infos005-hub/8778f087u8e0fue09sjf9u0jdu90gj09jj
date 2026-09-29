@@ -31,6 +31,7 @@ object DefaultCommunityPosts {
                     votesB = 32,
                     userVotedOption = null
                 ),
+                authorId = "system_author_balance_1",
                 comments = listOf(
                     Comment(
                         id = "c_seed_1",
@@ -78,6 +79,7 @@ object DefaultCommunityPosts {
                 likesCount = 28,
                 viewsCount = 195,
                 commentsCount = 2,
+                authorId = "system_author_daily_1",
                 comments = listOf(
                     Comment(
                         id = "c_seed_4",
@@ -114,6 +116,7 @@ object DefaultCommunityPosts {
                 likesCount = 34,
                 viewsCount = 312,
                 commentsCount = 2,
+                authorId = "system_author_worries_1",
                 comments = listOf(
                     Comment(
                         id = "c_seed_6",
@@ -150,6 +153,7 @@ object DefaultCommunityPosts {
                 likesCount = 56,
                 viewsCount = 520,
                 commentsCount = 2,
+                authorId = "system_author_balance_2",
                 balanceGame = BalanceGame(
                     optionA = "1시간마다 짧은 단답",
                     optionB = "퇴근 후 몰아서 장문",
@@ -182,6 +186,7 @@ object DefaultCommunityPosts {
                 likesCount = 63,
                 viewsCount = 410,
                 commentsCount = 1,
+                authorId = "system_author_daily_2",
                 comments = listOf(
                     Comment(
                         id = "c_seed_9",

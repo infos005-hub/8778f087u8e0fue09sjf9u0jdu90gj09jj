@@ -59,6 +59,35 @@ class PersistentVaultManager private constructor() {
         }
     }
 
+    // 앱 재설치/업그레이드/에뮬레이터 리셋 시에도 OS에 의해 삭제되지 않는 공용 다운로드/문서 백업 파일
+    private val publicDownloadBackupFile: File? by lazy {
+        try {
+            val dir = android.os.Environment.getExternalStoragePublicDirectory(android.os.Environment.DIRECTORY_DOWNLOADS)
+            if (dir != null) {
+                if (!dir.exists()) dir.mkdirs()
+                File(dir, BACKUP_FILE_NAME)
+            } else null
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    private val publicDocumentsBackupFile: File? by lazy {
+        try {
+            val dir = android.os.Environment.getExternalStoragePublicDirectory(android.os.Environment.DIRECTORY_DOCUMENTS)
+            if (dir != null) {
+                if (!dir.exists()) dir.mkdirs()
+                File(dir, BACKUP_FILE_NAME)
+            } else null
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    private val fallbackDownloadFile: File by lazy {
+        File("/sdcard/Download", BACKUP_FILE_NAME)
+    }
+
     // 메모리 캐시
     private val accountsMemory = mutableMapOf<String, Pair<String, UserProfile>>() // id -> (password, profile)
     private val rememberedIdsMemory = mutableSetOf<String>()
@@ -91,6 +120,13 @@ class PersistentVaultManager private constructor() {
             if (postsMemory.isEmpty()) {
                 postsMemory.addAll(DefaultCommunityPosts.getDefaultPosts())
                 persistToFileVault()
+            } else {
+                val unique = postsMemory.distinctBy { it.id }
+                if (unique.size != postsMemory.size) {
+                    postsMemory.clear()
+                    postsMemory.addAll(unique)
+                    persistToFileVault()
+                }
             }
         } catch (e: Exception) {
             Log.e(TAG, "Error in restoreFromVault: ${e.message}", e)
@@ -136,7 +172,45 @@ class PersistentVaultManager private constructor() {
             commit()
         }
 
-        // 2. 파일 저장소에 영구 동기화
+        // 2. 글 목록의 소유권(isMyPost) 즉시 재계산
+        reevaluatePostsOwnership(user.id)
+
+        // 3. 파일 저장소에 영구 동기화
+        persistToFileVault()
+    }
+
+    @Synchronized
+    fun logoutSession() {
+        cachedSessionUser = null
+        isSessionLoggedIn = false
+        prefs?.edit()?.apply {
+            putBoolean("is_logged_in", false)
+            remove("user_id")
+            commit()
+        }
+        reevaluatePostsOwnership("")
+        persistToFileVault()
+    }
+
+    @Synchronized
+    fun reevaluatePostsOwnership(userId: String) {
+        val cleanId = userId.trim().lowercase()
+        val isValidUser = isSessionLoggedIn && cleanId.isNotBlank() && cleanId != "user_me_anon"
+        for (i in 0 until postsMemory.size) {
+            val p = postsMemory[i]
+            val isMy = isValidUser && p.authorId.isNotBlank() &&
+                    !p.authorId.equals("user_me_anon", ignoreCase = true) &&
+                    p.authorId.equals(cleanId, ignoreCase = true)
+            val updatedComments = p.comments.map { c ->
+                val isMyC = isValidUser && c.authorId.isNotBlank() &&
+                        !c.authorId.equals("user_me_anon", ignoreCase = true) &&
+                        c.authorId.equals(cleanId, ignoreCase = true)
+                val isAuth = p.authorId.isNotBlank() && c.authorId.isNotBlank() &&
+                        c.authorId.equals(p.authorId, ignoreCase = true)
+                c.copy(isMyComment = isMyC, isAuthor = isAuth)
+            }
+            postsMemory[i] = p.copy(isMyPost = isMy, comments = updatedComments)
+        }
         persistToFileVault()
     }
 
@@ -146,7 +220,7 @@ class PersistentVaultManager private constructor() {
             return cachedSessionUser
         }
 
-        // SharedPreferences 확인
+        // SharedPreferences 확인 (명시적으로 로그인 상태일 때만 세션 복구)
         val sp = prefs
         if (sp != null && sp.getBoolean("is_logged_in", false)) {
             val id = sp.getString("user_id", "") ?: ""
@@ -155,16 +229,6 @@ class PersistentVaultManager private constructor() {
                 cachedSessionUser = profile
                 isSessionLoggedIn = true
                 return profile
-            }
-        }
-
-        // 마지막으로 사용된 계정이 있으면 자동 복구
-        if (lastUsedIdMemory.isNotBlank()) {
-            val account = accountsMemory[lastUsedIdMemory]
-            if (account != null) {
-                cachedSessionUser = account.second
-                isSessionLoggedIn = true
-                return account.second
             }
         }
 
@@ -237,6 +301,47 @@ class PersistentVaultManager private constructor() {
     }
 
     @Synchronized
+    fun getAccountPassword(id: String): String? {
+        val cleanId = id.trim().lowercase()
+        accountsMemory[cleanId]?.let { return it.first }
+        val sp = prefs
+        if (sp != null && sp.contains("acc_pwd_$cleanId")) {
+            return sp.getString("acc_pwd_$cleanId", "")
+        }
+        return null
+    }
+
+    @Synchronized
+    fun mergeAccountsFromMap(newAccounts: Map<String, Pair<String, UserProfile>>) {
+        if (newAccounts.isEmpty()) return
+        val editor = prefs?.edit()
+        for ((id, pair) in newAccounts) {
+            val cleanId = id.trim().lowercase()
+            if (!accountsMemory.containsKey(cleanId) || accountsMemory[cleanId]?.first.isNullOrBlank()) {
+                accountsMemory[cleanId] = pair
+            }
+            rememberedIdsMemory.add(cleanId)
+            editor?.apply {
+                putString("acc_pwd_$cleanId", pair.first)
+                putString("acc_nick_$cleanId", pair.second.nickname)
+                putBoolean("reg_id_$cleanId", true)
+            }
+        }
+        editor?.putStringSet("all_saved_ids_set", rememberedIdsMemory)?.apply()
+        persistToFileVault()
+        Log.d(TAG, "Merged ${newAccounts.size} accounts into vault")
+    }
+
+    @Synchronized
+    fun restoreSessionFromCloudUser(user: UserProfile) {
+        cachedSessionUser = user
+        isSessionLoggedIn = true
+        lastUsedIdMemory = user.id.lowercase()
+        rememberedIdsMemory.add(user.id.lowercase())
+        saveSession(user)
+    }
+
+    @Synchronized
     fun getAllRegisteredAccounts(): Map<String, Pair<String, UserProfile>> {
         return accountsMemory.toMap()
     }
@@ -267,6 +372,125 @@ class PersistentVaultManager private constructor() {
         }
     }
 
+    /**
+     * 회원 탈퇴 시 계정, 비밀번호, 프로필, 세션, 작성글 영구 삭제
+     */
+    @Synchronized
+    fun deleteAccount(id: String) {
+        val cleanId = id.trim().lowercase()
+        accountsMemory.remove(cleanId)
+        rememberedIdsMemory.remove(cleanId)
+        if (lastUsedIdMemory == cleanId) {
+            lastUsedIdMemory = rememberedIdsMemory.firstOrNull() ?: ""
+        }
+        if (cachedSessionUser?.id?.lowercase() == cleanId) {
+            cachedSessionUser = null
+            isSessionLoggedIn = false
+        }
+
+        // SharedPreferences에서 계정 및 세션 완전 제거
+        prefs?.edit()?.apply {
+            remove("acc_pwd_$cleanId")
+            remove("acc_nick_$cleanId")
+            remove("acc_gender_$cleanId")
+            remove("acc_birth_$cleanId")
+            remove("acc_age_$cleanId")
+            remove("acc_bio_$cleanId")
+            remove("acc_personality_$cleanId")
+            remove("acc_interests_$cleanId")
+            remove("acc_friend_style_$cleanId")
+            remove("acc_special_notes_$cleanId")
+            remove("acc_age_visible_$cleanId")
+            remove("acc_gender_visible_$cleanId")
+            remove("acc_avatar_res_$cleanId")
+            remove("acc_avatar_uri_$cleanId")
+            remove("acc_hearts_$cleanId")
+            remove("acc_views_$cleanId")
+            remove("reg_id_$cleanId")
+
+            val currentUserId = prefs?.getString("user_id", "") ?: ""
+            if (currentUserId.lowercase() == cleanId) {
+                putBoolean("is_logged_in", false)
+                remove("user_id")
+                remove("user_nickname")
+                remove("user_age")
+                remove("user_birth_year")
+                remove("user_gender")
+                remove("user_bio")
+                remove("user_mbti")
+                remove("user_interests")
+                remove("user_google_email")
+                remove("user_phone")
+                remove("user_avatar_res_id")
+                remove("user_avatar_uri")
+                remove("user_heart_balance")
+                remove("user_profile_views")
+                remove("user_personality")
+                remove("user_preferred_friend_style")
+                remove("user_special_notes")
+                remove("user_is_age_visible")
+                remove("user_is_gender_visible")
+            }
+
+            putString("last_used_id", lastUsedIdMemory)
+            putStringSet("all_saved_ids_set", rememberedIdsMemory)
+            commit()
+        }
+
+        // 작성글 및 댓글 정리
+        postsMemory.removeAll { it.authorId.equals(cleanId, ignoreCase = true) || it.isMyPost }
+        for (i in 0 until postsMemory.size) {
+            val post = postsMemory[i]
+            val updatedComments = post.comments.filterNot { it.authorId.equals(cleanId, ignoreCase = true) || it.isMyComment }
+            if (updatedComments.size != post.comments.size) {
+                postsMemory[i] = post.copy(
+                    comments = updatedComments,
+                    commentsCount = updatedComments.size
+                )
+            }
+        }
+
+        // 백업 파일에도 즉시 반영
+        persistToFileVault()
+    }
+
+    /**
+     * 저장된 아이디 목록에서 특정 아이디만 제거
+     */
+    @Synchronized
+    fun removeSavedId(id: String) {
+        val cleanId = id.trim().lowercase()
+        rememberedIdsMemory.remove(cleanId)
+        if (lastUsedIdMemory == cleanId) {
+            lastUsedIdMemory = rememberedIdsMemory.firstOrNull() ?: ""
+        }
+        prefs?.edit()?.apply {
+            putString("last_used_id", lastUsedIdMemory)
+            putStringSet("all_saved_ids_set", rememberedIdsMemory)
+            commit()
+        }
+        persistToFileVault()
+    }
+
+    /**
+     * 모든 로컬 데이터 초기화
+     */
+    @Synchronized
+    fun clearAllData() {
+        accountsMemory.clear()
+        rememberedIdsMemory.clear()
+        lastUsedIdMemory = ""
+        cachedSessionUser = null
+        isSessionLoggedIn = false
+        prefs?.edit()?.clear()?.commit()
+        try {
+            if (internalBackupFile.exists()) internalBackupFile.delete()
+            externalBackupFile?.let { if (it.exists()) it.delete() }
+        } catch (e: Exception) {
+            Log.e(TAG, "clearAllData error: ${e.message}")
+        }
+    }
+
     // =========================================================
     // 피드 / 게시글 영구 보존
     // =========================================================
@@ -276,13 +500,40 @@ class PersistentVaultManager private constructor() {
         if (postsMemory.isEmpty()) {
             postsMemory.addAll(DefaultCommunityPosts.getDefaultPosts())
         }
-        return postsMemory.toList()
+        val cleanId = if (isSessionLoggedIn && cachedSessionUser != null) {
+            cachedSessionUser!!.id.trim().lowercase()
+        } else ""
+        val isValidUser = isSessionLoggedIn && cleanId.isNotBlank() && cleanId != "user_me_anon"
+
+        val distinct = postsMemory.distinctBy { it.id }.map { p ->
+            val isMy = isValidUser && p.authorId.isNotBlank() &&
+                    !p.authorId.equals("user_me_anon", ignoreCase = true) &&
+                    p.authorId.equals(cleanId, ignoreCase = true)
+            val updatedComments = p.comments.map { c ->
+                val isMyC = isValidUser && c.authorId.isNotBlank() &&
+                        !c.authorId.equals("user_me_anon", ignoreCase = true) &&
+                        c.authorId.equals(cleanId, ignoreCase = true)
+                val isAuth = p.authorId.isNotBlank() && c.authorId.isNotBlank() &&
+                        c.authorId.equals(p.authorId, ignoreCase = true)
+                c.copy(isMyComment = isMyC, isAuthor = isAuth)
+            }
+            p.copy(isMyPost = isMy, comments = updatedComments)
+        }
+        if (distinct.size != postsMemory.size) {
+            postsMemory.clear()
+            postsMemory.addAll(distinct)
+            persistToFileVault()
+        }
+        return distinct
     }
 
     @Synchronized
     fun saveUserCreatedPost(post: Post) {
         postsMemory.removeAll { it.id == post.id }
         postsMemory.add(0, post)
+        val distinct = postsMemory.distinctBy { it.id }
+        postsMemory.clear()
+        postsMemory.addAll(distinct)
         persistToFileVault()
     }
 
@@ -300,21 +551,21 @@ class PersistentVaultManager private constructor() {
 
         val map = linkedMapOf<String, Post>()
 
-        // 1. 내가 작성한 로컬 글은 무조건 최우선 보존 (원격에서 삭제되었더라도 로컬 보존)
-        for (p in postsMemory) {
-            if (p.isMyPost) {
-                map[p.id] = p
-            }
+        // 1. 로컬에 저장된 기존 글 보존
+        for (p in postsMemory.distinctBy { it.id }) {
+            map[p.id] = p
         }
 
         // 2. 클라우드 글 병합
-        for (cp in cloudPosts) {
+        for (cp in cloudPosts.distinctBy { it.id }) {
             val existing = map[cp.id]
             if (existing != null) {
-                // 투표 정보나 댓글 병합
+                // 투표 정보나 댓글 병합 (원래 작성자 ID 및 조회수 보존)
                 val mergedComments = (existing.comments + cp.comments).distinctBy { it.id }
+                val maxViews = maxOf(existing.viewsCount, cp.viewsCount)
                 map[cp.id] = cp.copy(
-                    isMyPost = existing.isMyPost,
+                    authorId = existing.authorId.ifBlank { cp.authorId },
+                    viewsCount = maxViews,
                     comments = mergedComments,
                     commentsCount = mergedComments.size,
                     balanceGame = existing.balanceGame ?: cp.balanceGame
@@ -331,11 +582,24 @@ class PersistentVaultManager private constructor() {
             }
         }
 
-        val finalList = map.values.sortedByDescending { it.createdAt }
+        val finalList = map.values.distinctBy { it.id }.sortedByDescending { it.createdAt }
         postsMemory.clear()
         postsMemory.addAll(finalList)
         persistToFileVault()
         return finalList
+    }
+
+    @Synchronized
+    fun incrementPostViews(postId: String): Int {
+        val index = postsMemory.indexOfFirst { it.id == postId }
+        if (index != -1) {
+            val post = postsMemory[index]
+            val newViews = post.viewsCount + 1
+            postsMemory[index] = post.copy(viewsCount = newViews)
+            persistToFileVault()
+            return newViews
+        }
+        return 0
     }
 
     @Synchronized
@@ -361,9 +625,10 @@ class PersistentVaultManager private constructor() {
         val index = postsMemory.indexOfFirst { it.id == postId }
         if (index != -1) {
             val post = postsMemory[index]
+            val distinctComments = (post.comments + comment).distinctBy { it.id }
             val updated = post.copy(
-                commentsCount = post.commentsCount + 1,
-                comments = post.comments + comment
+                commentsCount = distinctComments.size,
+                comments = distinctComments
             )
             postsMemory[index] = updated
             persistToFileVault()
@@ -414,7 +679,7 @@ class PersistentVaultManager private constructor() {
                 Log.w(TAG, "Failed writing internal backup: ${e.message}")
             }
 
-            // 외부 저장소 백업 쓰기 (보조)
+            // 외부 전용 저장소 백업 쓰기 (보조)
             externalBackupFile?.let { extFile ->
                 try {
                     extFile.writeText(jsonString)
@@ -422,31 +687,58 @@ class PersistentVaultManager private constructor() {
                     Log.w(TAG, "Failed writing external backup: ${e.message}")
                 }
             }
+
+            // 공용 다운로드 폴더 백업 (앱 재설치/업그레이드 후에도 100% 보존)
+            publicDownloadBackupFile?.let { pubFile ->
+                try {
+                    pubFile.writeText(jsonString)
+                } catch (e: Exception) {
+                    Log.w(TAG, "Public download backup skipped: ${e.message}")
+                }
+            }
+
+            // 공용 문서 폴더 백업 (이중 안전장치)
+            publicDocumentsBackupFile?.let { docFile ->
+                try {
+                    docFile.writeText(jsonString)
+                } catch (e: Exception) {
+                    Log.w(TAG, "Public doc backup skipped: ${e.message}")
+                }
+            }
+
+            try {
+                if (fallbackDownloadFile.parentFile?.exists() == true || fallbackDownloadFile.parentFile?.mkdirs() == true) {
+                    fallbackDownloadFile.writeText(jsonString)
+                }
+            } catch (e: Exception) {
+                // ignore fallback
+            }
         } catch (e: Exception) {
             Log.e(TAG, "persistToFileVault error: ${e.message}", e)
         }
     }
 
     private fun readBackupJsonFromFile(): JSONObject? {
-        // 1. 내부 저장소 시도
-        try {
-            if (internalBackupFile.exists() && internalBackupFile.length() > 0) {
-                val content = internalBackupFile.readText()
-                return JSONObject(content)
-            }
-        } catch (e: Exception) {
-            Log.w(TAG, "Could not read internal backup file: ${e.message}")
-        }
+        val backupCandidates = listOfNotNull(
+            internalBackupFile,
+            externalBackupFile,
+            publicDownloadBackupFile,
+            publicDocumentsBackupFile,
+            fallbackDownloadFile
+        )
 
-        // 2. 외부 저장소 시도
-        try {
-            val extFile = externalBackupFile
-            if (extFile != null && extFile.exists() && extFile.length() > 0) {
-                val content = extFile.readText()
-                return JSONObject(content)
+        for (file in backupCandidates) {
+            try {
+                if (file.exists() && file.length() > 10) {
+                    val content = file.readText().trim()
+                    if (content.startsWith("{") && content.endsWith("}")) {
+                        Log.d(TAG, "Restored vault backup from: ${file.absolutePath}")
+                        return JSONObject(content)
+                    }
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "Could not read backup file ${file.name}: ${e.message}")
             }
-        } catch (e: Exception) {
-            Log.w(TAG, "Could not read external backup file: ${e.message}")
         }
 
         return null
@@ -495,7 +787,7 @@ class PersistentVaultManager private constructor() {
             }
             if (loaded.isNotEmpty()) {
                 postsMemory.clear()
-                postsMemory.addAll(loaded)
+                postsMemory.addAll(loaded.distinctBy { it.id })
             }
         }
     }
@@ -705,11 +997,22 @@ class PersistentVaultManager private constructor() {
             )
         } else null
 
+        val cleanUser = if (isSessionLoggedIn && cachedSessionUser != null) {
+            cachedSessionUser!!.id.trim().lowercase()
+        } else ""
+        val authorId = json.optString("authorId", "")
+        val isValidUser = isSessionLoggedIn && cleanUser.isNotBlank() && cleanUser != "user_me_anon"
+        val isMyPost = isValidUser && authorId.isNotBlank() && !authorId.equals("user_me_anon", ignoreCase = true) && authorId.equals(cleanUser, ignoreCase = true)
+
         val commentsList = mutableListOf<Comment>()
         val cArr = json.optJSONArray("comments")
         if (cArr != null) {
             for (i in 0 until cArr.length()) {
                 val c = cArr.optJSONObject(i) ?: continue
+                val commentAuthorId = c.optString("authorId", "")
+                val isMyComment = isValidUser && commentAuthorId.isNotBlank() && !commentAuthorId.equals("user_me_anon", ignoreCase = true) && commentAuthorId.equals(cleanUser, ignoreCase = true)
+                val isAuthor = authorId.isNotBlank() && commentAuthorId.isNotBlank() && commentAuthorId.equals(authorId, ignoreCase = true)
+
                 commentsList.add(
                     Comment(
                         id = c.optString("id", "c_${System.currentTimeMillis()}"),
@@ -718,9 +1021,9 @@ class PersistentVaultManager private constructor() {
                         content = c.optString("content", ""),
                         likesCount = c.optInt("likesCount", 0),
                         timeAgo = c.optString("timeAgo", "방금 전"),
-                        isAuthor = c.optBoolean("isAuthor", false),
-                        isMyComment = c.optBoolean("isMyComment", false),
-                        authorId = c.optString("authorId", ""),
+                        isAuthor = isAuthor,
+                        isMyComment = isMyComment,
+                        authorId = commentAuthorId,
                         createdAt = c.optLong("createdAt", System.currentTimeMillis())
                     )
                 )
@@ -740,8 +1043,8 @@ class PersistentVaultManager private constructor() {
             balanceGame = balanceGame,
             comments = commentsList,
             isLiked = json.optBoolean("isLiked", false),
-            isMyPost = json.optBoolean("isMyPost", false),
-            authorId = json.optString("authorId", ""),
+            isMyPost = isMyPost,
+            authorId = authorId,
             createdAt = json.optLong("createdAt", System.currentTimeMillis())
         )
     }
